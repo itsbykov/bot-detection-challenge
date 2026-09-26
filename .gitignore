@@ -1,0 +1,18 @@
+# данные и результаты
+data/
+submission.csv
+*.csv.gz
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# jupyter
+.ipynb_checkpoints/
+
+# системное
+.DS_Store
+.idea/
+.vscode/
