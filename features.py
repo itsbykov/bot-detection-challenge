@@ -21,6 +21,7 @@ SESSION_GAP_S = 30 * 60      # пауза длиннее 30 минут начи�
 FAST_DT_S = 10               # «быстрый» интервал между действиями, сек
 METRONOME_TOL = 0.2          # интервал считается «как медиана», если отличается от неё не более чем на 20%
 NIGHT_HOURS = (0, 6)         # ночь: 0:00–5:59
+SCREEN_W, SCREEN_H = 1920, 1080   # размер экрана для координат курсора
 
 PLATFORM_MAP = {'web': 'web', 'desktop': 'web',
                 'android': 'android',
@@ -222,18 +223,56 @@ def feat_diversity(ev: pd.DataFrame) -> pd.DataFrame:
     return f
 
 
+def _ks_uniform(u: np.ndarray) -> float:
+    """Статистика Колмогорова–Смирнова: насколько выборка u из [0, 1] непохожа на равномерную."""
+    u = np.sort(u)
+    n = len(u)
+    i = np.arange(1, n + 1)
+    return float(max((i / n - u).max(), (u - (i - 1) / n).max()))
+
+
 def feat_cursor(ev: pd.DataFrame) -> pd.DataFrame:
-    """Курсор. Существует только на web, поэтому для мобильных куки признаки = NaN."""
+    """
+    Курсор. Существует только на web, поэтому для мобильных куки признаки = NaN.
+
+    Наблюдение из EDA (eda_cursor.ipynb): у людей координаты курсора распределены
+    равномерно по всему экрану (std X ≈ 1920/sqrt(12) ≈ 554, std Y ≈ 1080/sqrt(12) ≈ 312),
+    а у ботов курсор сжат в свою область экрана, смещённую от центра.
+    Поэтому признаки измеряют, насколько координаты куки НЕпохожи на равномерный шум.
+    """
     web = ev[ev.plat == 'web']
     f = pd.DataFrame(index=web.cookie_id.unique())
     f['pointer_share'] = web.pointer_x.notna().groupby(web.cookie_id).mean()
 
-    p = web[web.pointer_x.notna()]
+    p = web[web.pointer_x.notna()].copy()
+    p['ux'] = p.pointer_x / SCREEN_W            # координаты в долях экрана, [0, 1]
+    p['uy'] = p.pointer_y / SCREEN_H
     pg = p.groupby('cookie_id')
+    n = pg.size()
+
+    # разброс координат. (Доля повторов координат и доля точек (0, 0) убраны:
+    # они отличаются от константы меньше чем у 10 куки из ~4000 — сигнала нет.)
     f['pointer_x_std'] = pg.pointer_x.std()
     f['pointer_y_std'] = pg.pointer_y.std()
-    f['pointer_unique_share'] = p.duplicated(['cookie_id', 'pointer_x', 'pointer_y']).groupby(p.cookie_id).mean().rsub(1)
-    f['pointer_origin_share'] = ((p.pointer_x == 0) & (p.pointer_y == 0)).groupby(p.cookie_id).mean()
+
+    # 1. смещение центра масс от центра экрана, нормированное на число точек.
+    #    У равномерного распределения среднее n точек ≈ центр ± std/sqrt(n), std = 1/sqrt(12) в долях экрана.
+    se = (1 / np.sqrt(12)) / np.sqrt(n)
+    zx = (pg.ux.mean() - 0.5).abs() / se
+    zy = (pg.uy.mean() - 0.5).abs() / se
+    f['pointer_center_z'] = np.hypot(zx, zy)
+
+    # 2. средний сдвиг курсора между соседними событиями (в долях диагонали экрана)
+    step = np.hypot(pg.ux.diff() * SCREEN_W, pg.uy.diff() * SCREEN_H) / np.hypot(SCREEN_W, SCREEN_H)
+    f['pointer_step_mean'] = step.groupby(p.cookie_id).mean()
+
+    # 3. покрытие экрана: какую долю ширины и высоты занимают координаты куки
+    f['pointer_range_x'] = pg.ux.max() - pg.ux.min()
+    f['pointer_range_y'] = pg.uy.max() - pg.uy.min()
+
+    # 4. статистика Колмогорова–Смирнова против равномерного распределения по каждой оси
+    f['pointer_ks_x'] = pg.ux.apply(lambda s: _ks_uniform(s.to_numpy()))
+    f['pointer_ks_y'] = pg.uy.apply(lambda s: _ks_uniform(s.to_numpy()))
     return f
 
 
@@ -250,24 +289,39 @@ def feat_client(ev: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- сборка
 
-def build_features(events: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
+# группы признаков: имя -> функция. Имена используются в абляции (ablation.py, train.py --drop-group)
+FEATURE_GROUPS = {
+    'cookie_age':      lambda ev, meta: feat_cookie_age(ev, meta),
+    'volume_sessions': lambda ev, meta: feat_volume_sessions(ev),
+    'timing':          lambda ev, meta: feat_timing(ev),
+    'hours':           lambda ev, meta: feat_hours(ev),
+    'event_mix':       lambda ev, meta: feat_event_mix(ev),
+    'diversity':       lambda ev, meta: feat_diversity(ev),
+    'cursor':          lambda ev, meta: feat_cursor(ev),
+    'client':          lambda ev, meta: feat_client(ev),
+}
+
+
+def build_features(events: pd.DataFrame, meta: pd.DataFrame,
+                   return_groups: bool = False):
     """
     Признаки для всех куки из meta. Возвращает DataFrame: cookie_id + признаки,
     строки в порядке meta. У куки без событий в окне поведенческие признаки = NaN, n_events = 0.
+
+    return_groups=True — дополнительно вернуть словарь {группа: список колонок}.
     """
     ev = clean_events(events, meta)
-    parts = [feat_cookie_age(ev, meta),
-             feat_volume_sessions(ev),
-             feat_timing(ev),
-             feat_hours(ev),
-             feat_event_mix(ev),
-             feat_diversity(ev),
-             feat_cursor(ev),
-             feat_client(ev)]
+    parts, groups = [], {}
+    for name, fn in FEATURE_GROUPS.items():
+        part = fn(ev, meta)
+        parts.append(part)
+        groups[name] = list(part.columns)
+
     X = pd.concat(parts, axis=1).reindex(meta.cookie_id)
     X['n_events'] = X.n_events.fillna(0)
     X.index.name = 'cookie_id'
-    return X.reset_index()
+    X = X.reset_index()
+    return (X, groups) if return_groups else X
 
 
 def feature_columns(X: pd.DataFrame) -> list[str]:
