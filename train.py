@@ -3,9 +3,9 @@
 
     python train.py                  # CV по дням + holdout + обучение на всём train + submission.csv
     python train.py --no-submit      # только CV и holdout (для экспериментов с признаками)
-    python train.py --n-seeds 2      # быстрее: меньше сидов в усреднении
+    python train.py --n-seeds 2      # быстрая версия
     python train.py --drop-group cursor --no-submit   # выключить ещё одну группу (см. features.FEATURE_GROUPS)
-    python train.py --all-groups     # все 8 групп признаков, включая исключённые по абляции
+    python train.py --all-groups     # все 8 групп признаков, включая исключённые по проведенной абляции
 
 Модель — LightGBM, усреднение предсказаний по нескольким сидам
 (снижает дисперсию и почти убирает одинаковые score, которые метрика склеивает в группы).
@@ -36,7 +36,7 @@
    примерно до ±1.5 п.п. и усредняет разные периоды.
 
    Почему допустимо, что модель в части фолдов учится на более поздних днях,
-   чем валидирует («смотрит в будущее»):
+   чем валидирует:
 
    a) Нет утечки через объект. Куки в train уникальны, каждая относится ровно к одному
       суточному окну. Одна и та же кука не может оказаться и в обучении, и в валидации.
@@ -56,11 +56,13 @@
       в test нет. Если зависимость «признаки → таргет» не меняется во времени,
       то порядок дней для оценки качества не важен, и K-fold даёт несмещённую оценку.
 
-   Ограничение: пункт (d) проверен только на маргинальных распределениях. Если поведение
-   ботов дрейфует (сервисы меняют тактику), K-fold будет оптимистичен. Намёк на это есть:
-   последние фолды (16–19.04) хуже остальных. Поэтому нужна вторая оценка.
+    Ограничение: стационарность проверена по распределению признаков (adversarial validation:
+    train против test ROC-AUC 0.50, боты недели 1 против ботов недели 2 — 0.52), но не по связи
+    признаков с таргетом: если сервисы меняют тактику так, что то же поведение начинает означать
+    другое, K-fold будет оптимистичен. Намёк на это есть: последние фолды (16–19.04) хуже
+    остальных. Поэтому нужна вторая оценка.
 
-2. HOLDOUT ВПЕРЁД ВО ВРЕМЕНИ — проверка переносимости на будущее.
+2. HOLDOUT ВПЕРЁД ВО ВРЕМЕНИ.
 
    Обучение на 06.04–12.04, валидация на 13.04–19.04. Та же форма, что у реального теста
    (целая неделя, строго позже обучения). Если улучшение есть на CV, но пропадает здесь —
@@ -86,17 +88,17 @@ from metric import precision_at_recall, recall_at_fpr
 
 # ---------------------------------------------------------------- настройки
 
-VALID_START = '2026-04-13'          # holdout вперёд во времени: окна 13.04–19.04
-DAYS_PER_FOLD = 2                   # CV: 14 дней train -> 7 фолдов по 2 дня
+VALID_START = '2026-04-13'          # holdout вперёд во времени
+DAYS_PER_FOLD = 2                   # CV
 N_SEEDS = 5
 
-# Группы признаков, которые НЕ идут в модель (результат абляции, ablation.py).
+# Группы признаков, которые НЕ идут в модель (по результатам абляции).
 # По отдельности и все вместе они не меняют качество в пределах шума:
 #   все 65 признаков : CV P@R 0.7702, PR-AUC 0.7923 | holdout P@R 0.6925, PR-AUC 0.7771
 #   без этих 4 групп : CV P@R 0.7836, PR-AUC 0.7910 | holdout P@R 0.7097, PR-AUC 0.7749
 # Их сигнал (возраст куки, объём, суточный профиль, тип клиента) уже покрыт группами
 # cursor / diversity / timing / event_mix. Убираем ради простоты и интерпретируемости.
-# Сами функции остаются в features.py, вернуть группы можно флагом --all-groups.
+# Сами функции оставляем в features.py, вернуть группы можно флагом --all-groups.
 EXCLUDED_GROUPS = ['cookie_age', 'volume_sessions', 'hours', 'client']
 
 LGB_PARAMS = dict(
@@ -109,7 +111,7 @@ LGB_PARAMS = dict(
     subsample_freq=1,
     colsample_bytree=0.8,
     reg_lambda=1.0,
-    deterministic=True,             # воспроизводимость между запусками
+    deterministic=True,             # требуемая воспроизводимость между запусками
     force_row_wise=True,
     verbose=-1,
 )
@@ -119,7 +121,7 @@ LGB_PARAMS = dict(
 
 def fit_predict(X_fit: pd.DataFrame, y_fit: np.ndarray, X_pred: pd.DataFrame,
                 seeds: list[int]) -> tuple[np.ndarray, pd.Series]:
-    """Обучает по модели на каждый сид, возвращает средний score и среднюю важность (gain)."""
+    # обучает по модели на каждый сид, возвращает средний score и средний gain.
     preds, imps = [], []
     for seed in seeds:
         model = lgb.LGBMClassifier(**LGB_PARAMS, random_state=seed)
@@ -130,7 +132,7 @@ def fit_predict(X_fit: pd.DataFrame, y_fit: np.ndarray, X_pred: pd.DataFrame,
 
 
 def report(y: np.ndarray, score: np.ndarray, title: str) -> None:
-    """Официальная метрика + диагностика."""
+    # официальная метрика + диагностика.
     print(f'--- {title}')
     print(f'  P@R>=0.7      : {precision_at_recall(y, score):.4f}')
     print(f'  PR-AUC        : {average_precision_score(y, score):.4f}')
@@ -140,7 +142,7 @@ def report(y: np.ndarray, score: np.ndarray, title: str) -> None:
 
 
 def day_folds(meta: pd.DataFrame, days_per_fold: int = DAYS_PER_FOLD) -> np.ndarray:
-    """Номер фолда для каждой куки: подряд идущие дни окна группами по days_per_fold."""
+    # номер фолда для каждой куки.
     day = meta.window_start_ts.dt.normalize()
     day_idx = np.searchsorted(np.sort(day.unique()), day)
     return day_idx // days_per_fold
@@ -148,7 +150,7 @@ def day_folds(meta: pd.DataFrame, days_per_fold: int = DAYS_PER_FOLD) -> np.ndar
 
 def run_cv(X: pd.DataFrame, y: np.ndarray, meta: pd.DataFrame, cols: list[str],
            seeds: list[int], verbose: bool = True) -> np.ndarray:
-    """CV с группировкой по дням: OOF-предсказания + метрика по каждому фолду и по всем сразу."""
+    # CV с группировкой по дням - OOF-предсказания + метрика по каждому фолду и по всем сразу.
     folds = day_folds(meta)
     oof = np.zeros(len(y))
     if verbose:
@@ -166,7 +168,7 @@ def run_cv(X: pd.DataFrame, y: np.ndarray, meta: pd.DataFrame, cols: list[str],
 
 
 def select_columns(groups: dict[str, list[str]], drop: list[str] | None = None) -> list[str]:
-    """Колонки всех групп, кроме перечисленных в drop."""
+    # колонки всех групп, кроме перечисленных в drop.
     drop = drop or []
     unknown = set(drop) - set(groups)
     if unknown:
@@ -177,7 +179,7 @@ def select_columns(groups: dict[str, list[str]], drop: list[str] | None = None) 
 # ---------------------------------------------------------------- main
 
 def main(submit: bool = True, n_seeds: int = N_SEEDS, drop_groups: list[str] | None = None) -> None:
-    """drop_groups — какие группы признаков не использовать (по умолчанию EXCLUDED_GROUPS)."""
+    # drop_groups — какие группы признаков не использовать (по умолчанию EXCLUDED_GROUPS).
     t0 = time.time()
     seeds = list(range(n_seeds))
     train, test, events = load_data()
@@ -188,10 +190,10 @@ def main(submit: bool = True, n_seeds: int = N_SEEDS, drop_groups: list[str] | N
     print(f'используются группы: {[g for g in groups if g not in (drop_groups or [])]}')
     print(f'признаки собраны: {len(cols)} шт., train {X_tr.shape}, test {X_te.shape}, {time.time() - t0:.1f} с\n')
 
-    # ---- 1. CV по дням (основа для решений)
+    # CV
     run_cv(X_tr, y, train, cols, seeds)
 
-    # ---- 2. holdout вперёд во времени (проверка переносимости)
+    # holdout
     is_valid = (train.window_start_ts >= VALID_START).values
     p_valid, imp = fit_predict(X_tr.loc[~is_valid, cols], y[~is_valid], X_tr.loc[is_valid, cols], seeds)
     print()
@@ -204,11 +206,11 @@ def main(submit: bool = True, n_seeds: int = N_SEEDS, drop_groups: list[str] | N
         print(f'\nготово за {time.time() - t0:.1f} с')
         return
 
-    # ---- 3. финал: весь train → test
+    # train → test
     p_test, _ = fit_predict(X_tr[cols], y, X_te[cols], seeds)
     sub = pd.DataFrame({'cookie_id': X_te.cookie_id, 'score': p_test})
 
-    # проверки формата: ровно куки из test, по одной строке, score в [0, 1]
+    # проверки формата. Куки из test, по одной строке, score в [0, 1].
     assert len(sub) == len(test) and sub.cookie_id.is_unique
     assert set(sub.cookie_id) == set(test.cookie_id)
     assert sub.score.between(0, 1).all() and sub.score.notna().all()
